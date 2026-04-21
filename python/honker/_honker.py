@@ -595,10 +595,8 @@ class Stream:
     def __init__(self, db, name: str):
         self.db = db
         self.name = name
-        # _honker_stream + _honker_stream_consumers ship in
-        # BOOTSTRAP_JOBLITE_SQL, so no per-Stream DDL needed — the
-        # tables already exist by the time Database wraps the
-        # connection.
+        # _honker_stream + _honker_stream_consumers are created by
+        # honker_bootstrap(), so no per-Stream DDL needed.
 
     def _channel(self) -> str:
         return f"honker:stream:{self.name}"
