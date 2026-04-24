@@ -140,11 +140,9 @@ fn serialize_payload(py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult<Str
 struct Database {
     writer: Arc<Writer>,
     readers: Arc<Readers>,
-    wal_path: std::path::PathBuf,
-    /// Lazy-initialized shared WAL watcher. One stat-poll thread per
-    /// Database regardless of how many listeners subscribe. Previously
-    /// every `wal_events()` spawned its own thread — 100 listeners
-    /// meant 100 stat threads hammering the same file.
+    db_path: std::path::PathBuf,
+    /// Lazy-initialized shared WAL watcher. One PRAGMA-poll thread per
+    /// Database regardless of how many listeners subscribe.
     shared_watcher: Mutex<Option<Arc<SharedWalWatcher>>>,
 }
 
@@ -162,11 +160,10 @@ impl Database {
         // extension registers, no `.dylib` load needed at runtime.
         honker_core::attach_honker_functions(&writer_conn)
             .map_err(core_err)?;
-        let wal_path: std::path::PathBuf = format!("{}-wal", path).into();
         Ok(Self {
             writer: Arc::new(Writer::new(writer_conn)),
-            readers: Arc::new(Readers::new(path, max_readers)),
-            wal_path,
+            readers: Arc::new(Readers::new(path.clone(), max_readers)),
+            db_path: path.into(),
             shared_watcher: Mutex::new(None),
         })
     }
@@ -191,14 +188,14 @@ impl Database {
             if let Some(existing) = guard.as_ref() {
                 existing.clone()
             } else {
-                let w = Arc::new(SharedWalWatcher::new(self.wal_path.clone()));
+                let w = Arc::new(SharedWalWatcher::new(self.db_path.clone()));
                 *guard = Some(w.clone());
                 w
             }
         };
         let (sub_id, rx) = shared.subscribe();
         Ok(WalEvents {
-            wal_path: self.wal_path.clone(),
+            db_path: self.db_path.clone(),
             shared,
             sub_id,
             inner: Arc::new(Mutex::new(WalWatchState {
@@ -401,7 +398,7 @@ struct WalWatchState {
 
 #[pyclass]
 struct WalEvents {
-    wal_path: std::path::PathBuf,
+    db_path: std::path::PathBuf,
     /// Keep the shared watcher alive as long as this subscription
     /// exists. `Drop` calls `shared.unsubscribe(sub_id)` so the bridge
     /// thread's `rx.recv()` sees a disconnect and exits.
@@ -480,7 +477,7 @@ impl WalEvents {
     /// Path this watcher is monitoring. Useful in tests / debugging.
     #[getter]
     fn path(&self) -> String {
-        self.wal_path.to_string_lossy().into_owned()
+        self.db_path.to_string_lossy().into_owned()
     }
 }
 
