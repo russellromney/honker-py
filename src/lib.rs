@@ -1,14 +1,14 @@
 //! PyO3 Python binding for honker.
 //!
 //! This crate is thin: it owns Python-flavored types (Database,
-//! Transaction, WalEvents pyclasses), marshals Python dict/list/bytes
+//! Transaction, UpdateEvents pyclasses), marshals Python dict/list/bytes
 //! to rusqlite params, and materializes rows into Python dicts. All
 //! the SQLite plumbing — connection opening, PRAGMAs, the notify()
- //! SQL function + notifications table, the writer/readers pools, the
- //! WAL-file watcher thread — lives in [`honker_core`] and is
- //! shared with the other bindings (cdylib extension, napi-rs Node).
+//! SQL function + notifications table, the writer/readers pools, the
+//! update watcher thread — lives in [`honker_core`] and is
+//! shared with the other bindings (cdylib extension, napi-rs Node).
 
-use honker_core::{Readers, SharedWalWatcher, Writer, open_conn};
+use honker_core::{Readers, SharedUpdateWatcher, Writer, open_conn};
 use parking_lot::Mutex;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
@@ -141,9 +141,9 @@ struct Database {
     writer: Arc<Writer>,
     readers: Arc<Readers>,
     db_path: std::path::PathBuf,
-    /// Lazy-initialized shared WAL watcher. One PRAGMA-poll thread per
+    /// Lazy-initialized shared update watcher. One PRAGMA-poll thread per
     /// Database regardless of how many listeners subscribe.
-    shared_watcher: Mutex<Option<Arc<SharedWalWatcher>>>,
+    shared_watcher: Mutex<Option<Arc<SharedUpdateWatcher>>>,
 }
 
 #[pymethods]
@@ -158,8 +158,7 @@ impl Database {
         // connection so Python can call `SELECT honker_foo(...)` inside
         // its own transactions — same implementations the loadable
         // extension registers, no `.dylib` load needed at runtime.
-        honker_core::attach_honker_functions(&writer_conn)
-            .map_err(core_err)?;
+        honker_core::attach_honker_functions(&writer_conn).map_err(core_err)?;
         Ok(Self {
             writer: Arc::new(Writer::new(writer_conn)),
             readers: Arc::new(Readers::new(path.clone(), max_readers)),
@@ -175,30 +174,30 @@ impl Database {
         })
     }
 
-    /// Watcher on this database's `.db-wal` file. Returns an async
-    /// iterator that yields `None` every time the WAL changes — i.e.
+    /// Watcher on this database's update stream. Returns an async
+    /// iterator that yields `None` every time the database updates — i.e.
     /// every time any process committed a transaction to this file.
     ///
     /// N calls share a single background poll thread via the core
-    /// [`SharedWalWatcher`]. Each subscriber gets its own bounded
+    /// [`SharedUpdateWatcher`]. Each subscriber gets its own bounded
     /// channel so a slow consumer can't block other listeners.
-    fn wal_events(&self) -> PyResult<WalEvents> {
+    fn update_events(&self) -> PyResult<UpdateEvents> {
         let shared = {
             let mut guard = self.shared_watcher.lock();
             if let Some(existing) = guard.as_ref() {
                 existing.clone()
             } else {
-                let w = Arc::new(SharedWalWatcher::new(self.db_path.clone()));
+                let w = Arc::new(SharedUpdateWatcher::new(self.db_path.clone()));
                 *guard = Some(w.clone());
                 w
             }
         };
         let (sub_id, rx) = shared.subscribe();
-        Ok(WalEvents {
+        Ok(UpdateEvents {
             db_path: self.db_path.clone(),
             shared,
             sub_id,
-            inner: Arc::new(Mutex::new(WalWatchState {
+            inner: Arc::new(Mutex::new(UpdateWatchState {
                 rx: Some(rx),
                 queue: None,
             })),
@@ -347,12 +346,7 @@ impl Transaction {
         run_query(py, conn, &sql, params.as_ref())
     }
 
-    fn notify(
-        &self,
-        py: Python<'_>,
-        channel: String,
-        payload: Bound<'_, PyAny>,
-    ) -> PyResult<i64> {
+    fn notify(&self, py: Python<'_>, channel: String, payload: Bound<'_, PyAny>) -> PyResult<i64> {
         let state = self.inner.lock();
         let conn = state
             .conn
@@ -383,10 +377,10 @@ impl Transaction {
 }
 
 // ---------------------------------------------------------------------
-// WalEvents (async iterator over a SharedWalWatcher subscription)
+// UpdateEvents (async iterator over a SharedUpdateWatcher subscription)
 // ---------------------------------------------------------------------
 
-struct WalWatchState {
+struct UpdateWatchState {
     /// Per-subscriber receiver from the shared watcher. Moved into
     /// the bridge thread on first `__aiter__`; on subsequent
     /// `__aiter__` calls the queue has been created and we return
@@ -397,27 +391,27 @@ struct WalWatchState {
 }
 
 #[pyclass]
-struct WalEvents {
+struct UpdateEvents {
     db_path: std::path::PathBuf,
     /// Keep the shared watcher alive as long as this subscription
     /// exists. `Drop` calls `shared.unsubscribe(sub_id)` so the bridge
     /// thread's `rx.recv()` sees a disconnect and exits.
-    shared: Arc<SharedWalWatcher>,
+    shared: Arc<SharedUpdateWatcher>,
     sub_id: u64,
-    inner: Arc<Mutex<WalWatchState>>,
+    inner: Arc<Mutex<UpdateWatchState>>,
 }
 
-impl Drop for WalEvents {
+impl Drop for UpdateEvents {
     fn drop(&mut self) {
         // Remove our sender from the shared watcher so the bridge
         // thread's rx.recv() returns Err and the thread exits. Without
         // this, the bridge thread + its Python-object references would
-        // leak until the last Arc<SharedWalWatcher> is dropped.
+        // leak until the last Arc<SharedUpdateWatcher> is dropped.
         self.shared.unsubscribe(self.sub_id);
     }
 }
 
-impl WalEvents {
+impl UpdateEvents {
     fn ensure_started(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let mut state = self.inner.lock();
         if let Some(q) = &state.queue {
@@ -431,15 +425,15 @@ impl WalEvents {
         let queue_py_for_thread = queue_py.clone_ref(py);
         let loop_py: Py<PyAny> = loop_obj.unbind();
 
-        let rx = state.rx.take().expect("wal rx already taken");
+        let rx = state.rx.take().expect("update rx already taken");
 
         std::thread::Builder::new()
-            .name("honker-wal-bridge".into())
+            .name("honker-update-bridge".into())
             .spawn(move || {
                 // Blocks on the subscriber channel. Exits when the
                 // shared watcher's sender list prunes this subscriber
-                // (happens when the Arc<SharedWalWatcher> inside
-                // WalEvents is dropped, severing our end of the
+                // (happens when the Arc<SharedUpdateWatcher> inside
+                // UpdateEvents is dropped, severing our end of the
                 // channel — recv() then returns Err).
                 while rx.recv().is_ok() {
                     Python::attach(|py| {
@@ -447,11 +441,7 @@ impl WalEvents {
                             Ok(v) => v,
                             Err(_) => return,
                         };
-                        let _ = loop_py.call_method1(
-                            py,
-                            "call_soon_threadsafe",
-                            (put, py.None()),
-                        );
+                        let _ = loop_py.call_method1(py, "call_soon_threadsafe", (put, py.None()));
                     });
                 }
             })
@@ -463,7 +453,7 @@ impl WalEvents {
 }
 
 #[pymethods]
-impl WalEvents {
+impl UpdateEvents {
     fn __aiter__<'a>(slf: PyRef<'a, Self>, py: Python<'a>) -> PyResult<PyRef<'a, Self>> {
         slf.ensure_started(py)?;
         Ok(slf)
@@ -508,6 +498,6 @@ fn _honker_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cron_next_after, m)?)?;
     m.add_class::<Database>()?;
     m.add_class::<Transaction>()?;
-    m.add_class::<WalEvents>()?;
+    m.add_class::<UpdateEvents>()?;
     Ok(())
 }

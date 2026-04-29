@@ -255,7 +255,7 @@ class Scheduler:
         # sleep — otherwise we'd oversleep past a freshly-registered
         # task whose next_fire_at is earlier than the previously
         # computed soonest.
-        wal = self.db.wal_events()
+        updates = self.db.update_events()
         while not stop_event.is_set():
             now = int(time.time())
             # tick + soonest share a writer transaction: honker_* scalars
@@ -274,27 +274,27 @@ class Scheduler:
             sleep_s = max(0.1, soonest - time.time())
             # Race three wake sources against the timer:
             #   - stop_event   → caller asked us to shut down
-            #   - WAL tick     → a register/unregister (or any other
+            #   - update tick     → a register/unregister (or any other
             #                    commit) happened; re-evaluate soonest
             #   - timeout      → the originally-computed soonest fired
             # Any of the three just falls through to the top of the loop.
             stop_task = asyncio.ensure_future(stop_event.wait())
-            wal_task = asyncio.ensure_future(wal.__anext__())
+            update_task = asyncio.ensure_future(updates.__anext__())
             try:
                 await asyncio.wait(
-                    {stop_task, wal_task},
+                    {stop_task, update_task},
                     timeout=sleep_s,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
             finally:
-                for t in (stop_task, wal_task):
+                for t in (stop_task, update_task):
                     if not t.done():
                         t.cancel()
                 # Surface task exceptions (other than CancelledError)
-                # so a broken wal iterator doesn't silently hang the
+                # so a broken update iterator doesn't silently hang the
                 # scheduler. Done tasks that we didn't await would
                 # otherwise warn at GC.
-                for t in (stop_task, wal_task):
+                for t in (stop_task, update_task):
                     try:
                         await t
                     except (asyncio.CancelledError, StopAsyncIteration):

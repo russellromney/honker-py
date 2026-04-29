@@ -53,9 +53,9 @@ class Listener:
         construction — historical notifications are not replayed (same
         shape as `pg_notify`). Use `db.stream(...)` if you want
         durable replay with per-consumer offsets.
-      * Wakes on every `.db-wal` change (any process, any writer) and
+      * Wakes on every database update (any process, any writer) and
         SELECTs new rows for this channel. Cross-process wake latency
-        is bounded by the 1 ms stat-poll cadence (p50 ~= 1–2 ms on
+        is bounded by the 1 ms update-watcher cadence (p50 ~= 1–2 ms on
         M-series).
       * Ordered by monotonic id; no duplicates.
       * The notifications table is NOT auto-pruned. Rows accumulate
@@ -72,7 +72,7 @@ class Listener:
         # the window between the two is captured in our mpsc channel
         # rather than firing to nobody. Regression guard:
         # tests/test_subscribe_race.py.
-        self._wal = db.wal_events()
+        self._updates = db.update_events()
         rows = db.query(
             "SELECT COALESCE(MAX(id), 0) AS m "
             "FROM _honker_notifications WHERE channel=?",
@@ -101,7 +101,7 @@ class Listener:
             # No new rows — wait on WAL. 15s paranoia timeout.
             try:
                 await asyncio.wait_for(
-                    self._wal.__anext__(), timeout=15.0
+                    self._updates.__anext__(), timeout=15.0
                 )
             except asyncio.TimeoutError:
                 pass
@@ -312,7 +312,7 @@ class Queue:
     ) -> AsyncIterator[Job]:
         """Async iterator over this queue. Yields one claimed Job per
         `__anext__` via a single-row `claim_batch(worker_id, 1)` — one
-        write transaction per job. Wakes on WAL commit from any process;
+        write transaction per job. Wakes on database update from any process;
         `idle_poll_s` is a paranoia fallback for environments where the
         stat watcher can't fire.
 
@@ -393,17 +393,17 @@ class Queue:
     ) -> Any:
         """Block until a result is saved for `job_id`, then return it.
 
-        Wakes on every WAL commit (any process), so a worker in a
+        Wakes on every database update (any process), so a worker in a
         different process saving the result is picked up within the
-        stat-poll cadence. `timeout` is in seconds; `None` waits
+        update-watcher cadence. `timeout` is in seconds; `None` waits
         forever. Raises `asyncio.TimeoutError` on expiry.
         """
         deadline = time.time() + float(timeout) if timeout is not None else None
         # Subscribe BEFORE the first check so a worker saving the result
-        # in the window between get_result() and wal_events() fires a
+        # in the window between get_result() and update_events() fires a
         # wake into our mpsc channel rather than to nobody. Regression
         # guard: tests/test_subscribe_race.py.
-        wal = self.db.wal_events()
+        updates = self.db.update_events()
         found, value = self.get_result(job_id)
         if found:
             return value
@@ -416,7 +416,7 @@ class Queue:
                     f"wait_result({job_id}) timed out"
                 )
             try:
-                await asyncio.wait_for(wal.__anext__(), timeout=remaining)
+                await asyncio.wait_for(updates.__anext__(), timeout=remaining)
             except asyncio.TimeoutError:
                 if deadline is None:
                     # Paranoia-poll on the 15s fallback; loop again.
@@ -699,11 +699,11 @@ class _StreamIter:
         # `deque` for O(1) popleft; `list.pop(0)` was O(n) per yield which
         # compounded on large replay batches (default 1000 rows per refresh).
         self._buffer: deque = deque()
-        # Set up the WAL watcher BEFORE the first read so writes during
-        # "read empty" -> "start listening" can't slip through. WAL fires
+        # Set up the update watcher BEFORE the first read so writes during
+        # "read empty" -> "start listening" can't slip through. update watcher fires
         # on every commit (any process), so it covers both same-process
         # and cross-process publishers.
-        self._wal = stream.db.wal_events()
+        self._updates = stream.db.update_events()
         # Offset auto-save bookkeeping.
         self._consumer = consumer
         self._save_every_n = max(0, save_every_n)
@@ -756,7 +756,7 @@ class _StreamIter:
             # Block on WAL — fires on any commit to the DB. Covers both
             # same-process and cross-process publishers. 15s fallback.
             try:
-                await asyncio.wait_for(self._wal.__anext__(), timeout=15.0)
+                await asyncio.wait_for(self._updates.__anext__(), timeout=15.0)
             except asyncio.TimeoutError:
                 pass
             except StopAsyncIteration:
@@ -914,8 +914,8 @@ class Database:
     def listen(self, channel: str):
         return Listener(self, channel)
 
-    def wal_events(self):
-        return self._inner.wal_events()
+    def update_events(self):
+        return self._inner.update_events()
 
     def query(self, sql: str, params=None):
         return self._inner.query(sql, params)
@@ -1154,10 +1154,10 @@ class _WorkerQueueIter:
     `claim_batch(worker_id, 1)`. One write transaction per job.
 
     Wake sources when the queue is empty:
-      1. WAL-file watcher (`db.wal_events()`): ~1ms wake on any commit
+      1. update watcher (`db.update_events()`): ~1ms wake on any commit
          to this database from any process. The shared watcher fans
          out to every subscriber; over-triggering is cheap.
-      2. `idle_poll_s` timeout: paranoia fallback if the WAL watcher
+      2. `idle_poll_s` timeout: paranoia fallback if the update watcher
          can't fire (sandboxed FS, odd container mount).
     """
 
@@ -1166,10 +1166,10 @@ class _WorkerQueueIter:
         self.worker_id = worker_id
         self.idle_poll_s = idle_poll_s
         # Subscribe eagerly so a commit landing between the first
-        # claim_batch() and the first wal_events() is buffered in our
+        # claim_batch() and the first update_events() is buffered in our
         # mpsc channel rather than firing to nobody. Regression guard:
         # tests/test_subscribe_race.py.
-        self._wal = queue.db.wal_events()
+        self._updates = queue.db.update_events()
 
     def __aiter__(self):
         return self
@@ -1181,7 +1181,7 @@ class _WorkerQueueIter:
                 return jobs[0]
             try:
                 await asyncio.wait_for(
-                    self._wal.__anext__(),
+                    self._updates.__anext__(),
                     timeout=self.idle_poll_s,
                 )
             except asyncio.TimeoutError:
