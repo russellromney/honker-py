@@ -83,8 +83,25 @@ class Listener:
     def __aiter__(self):
         return self
 
+    def close(self) -> None:
+        updates = self._updates
+        self._updates = None
+        if updates is not None:
+            updates.close()
+
+    async def aclose(self) -> None:
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
     async def __anext__(self) -> Notification:
         while True:
+            if self._updates is None:
+                raise StopAsyncIteration
             if self._buffer:
                 return self._buffer.popleft()
             rows = self.db.query(
@@ -718,6 +735,21 @@ class _StreamIter:
     def __aiter__(self):
         return self
 
+    def close(self) -> None:
+        updates = self._updates
+        self._updates = None
+        if updates is not None:
+            updates.close()
+
+    async def aclose(self) -> None:
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def _maybe_save_offset(self) -> None:
         if not self._consumer or self._pending_save_offset <= 0:
             return
@@ -736,6 +768,8 @@ class _StreamIter:
 
     async def __anext__(self):
         while True:
+            if self._updates is None:
+                raise StopAsyncIteration
             if self._buffer:
                 # Flush BEFORE yielding the next event. A crash during
                 # the user's handler rolls back in-progress work; the
@@ -910,6 +944,25 @@ class Database:
 
     def transaction(self):
         return self._inner.transaction()
+
+    def close(self) -> None:
+        inner = self._inner
+        self._inner = None
+        if inner is not None:
+            inner.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        self.close()
+        return False
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def listen(self, channel: str):
         return Listener(self, channel)
@@ -1174,8 +1227,25 @@ class _WorkerQueueIter:
     def __aiter__(self):
         return self
 
+    def close(self) -> None:
+        updates = self._updates
+        self._updates = None
+        if updates is not None:
+            updates.close()
+
+    async def aclose(self) -> None:
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
     async def __anext__(self):
         while True:
+            if self._updates is None:
+                raise StopAsyncIteration
             jobs = self.queue.claim_batch(self.worker_id, 1)
             if jobs:
                 return jobs[0]

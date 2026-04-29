@@ -138,12 +138,30 @@ fn serialize_payload(py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult<Str
 
 #[pyclass]
 struct Database {
-    writer: Arc<Writer>,
-    readers: Arc<Readers>,
+    writer: Mutex<Option<Arc<Writer>>>,
+    readers: Mutex<Option<Arc<Readers>>>,
     db_path: std::path::PathBuf,
     /// Lazy-initialized shared update watcher. One PRAGMA-poll thread per
     /// Database regardless of how many listeners subscribe.
     shared_watcher: Mutex<Option<Arc<SharedUpdateWatcher>>>,
+}
+
+impl Database {
+    fn writer(&self) -> PyResult<Arc<Writer>> {
+        self.writer
+            .lock()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))
+    }
+
+    fn readers(&self) -> PyResult<Arc<Readers>> {
+        self.readers
+            .lock()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| PyRuntimeError::new_err("Database is closed"))
+    }
 }
 
 #[pymethods]
@@ -160,8 +178,8 @@ impl Database {
         // extension registers, no `.dylib` load needed at runtime.
         honker_core::attach_honker_functions(&writer_conn).map_err(core_err)?;
         Ok(Self {
-            writer: Arc::new(Writer::new(writer_conn)),
-            readers: Arc::new(Readers::new(path.clone(), max_readers)),
+            writer: Mutex::new(Some(Arc::new(Writer::new(writer_conn)))),
+            readers: Mutex::new(Some(Arc::new(Readers::new(path.clone(), max_readers)))),
             db_path: path.into(),
             shared_watcher: Mutex::new(None),
         })
@@ -169,7 +187,7 @@ impl Database {
 
     fn transaction(&self) -> PyResult<Transaction> {
         Ok(Transaction {
-            writer: self.writer.clone(),
+            writer: self.writer()?,
             inner: Arc::new(Mutex::new(TxState::default())),
         })
     }
@@ -182,6 +200,7 @@ impl Database {
     /// [`SharedUpdateWatcher`]. Each subscriber gets its own bounded
     /// channel so a slow consumer can't block other listeners.
     fn update_events(&self) -> PyResult<UpdateEvents> {
+        self.writer()?;
         let shared = {
             let mut guard = self.shared_watcher.lock();
             if let Some(existing) = guard.as_ref() {
@@ -211,10 +230,19 @@ impl Database {
         sql: String,
         params: Option<Bound<'py, PyList>>,
     ) -> PyResult<Bound<'py, PyList>> {
-        let conn = self.readers.acquire().map_err(core_err)?;
+        let readers = self.readers()?;
+        let conn = readers.acquire().map_err(core_err)?;
         let result = run_query(py, &conn, &sql, params.as_ref());
-        self.readers.release(conn);
+        readers.release(conn);
         result
+    }
+
+    fn close(&self) {
+        if let Some(shared) = self.shared_watcher.lock().take() {
+            let _ = shared.close();
+        }
+        self.readers.lock().take();
+        self.writer.lock().take();
     }
 }
 
@@ -468,6 +496,10 @@ impl UpdateEvents {
     #[getter]
     fn path(&self) -> String {
         self.db_path.to_string_lossy().into_owned()
+    }
+
+    fn close(&self) {
+        self.shared.unsubscribe(self.sub_id);
     }
 }
 
