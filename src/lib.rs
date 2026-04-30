@@ -16,6 +16,7 @@ use pyo3::types::{PyAny, PyBool, PyBytes, PyDict, PyList};
 use rusqlite::Connection;
 use rusqlite::types::{Value, ValueRef};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 fn core_err<E: std::fmt::Display>(e: E) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
@@ -200,7 +201,9 @@ impl Database {
             inner: Arc::new(Mutex::new(UpdateWatchState {
                 rx: Some(rx),
                 queue: None,
+                bridge_handle: None,
             })),
+            shutdown: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -451,6 +454,14 @@ struct UpdateWatchState {
     rx: Option<std::sync::mpsc::Receiver<()>>,
     /// Python asyncio Queue, populated lazily on first __aiter__.
     queue: Option<Py<PyAny>>,
+    /// Bridge thread JoinHandle, populated on first `__aiter__`.
+    /// `Drop` joins this synchronously so the bridge thread is
+    /// guaranteed to have exited before this `UpdateEvents` goes
+    /// away. Required to prevent the panic tracked in the parent
+    /// repo's #16: without a join, the bridge thread can outlive
+    /// Python interpreter teardown and panic on its next
+    /// `Python::attach`.
+    bridge_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 #[pyclass]
@@ -462,15 +473,59 @@ struct UpdateEvents {
     shared: Arc<SharedUpdateWatcher>,
     sub_id: u64,
     inner: Arc<Mutex<UpdateWatchState>>,
+    /// Shared shutdown flag with the bridge thread. `Drop` sets this
+    /// before unsubscribing and joining. The bridge thread checks it
+    /// AFTER `rx.recv()` returns and BEFORE entering `Python::attach`,
+    /// so a tick already in-flight on the channel doesn't trigger a
+    /// post-shutdown call into Python.
+    shutdown: Arc<AtomicBool>,
 }
 
 impl Drop for UpdateEvents {
     fn drop(&mut self) {
-        // Remove our sender from the shared watcher so the bridge
-        // thread's rx.recv() returns Err and the thread exits. Without
-        // this, the bridge thread + its Python-object references would
-        // leak until the last Arc<SharedUpdateWatcher> is dropped.
+        // Order matters here:
+        //   1. Set shutdown FIRST so even an in-flight tick the bridge
+        //      thread is about to recv() doesn't race a Python::attach
+        //      after we start tearing down.
+        //   2. Unsubscribe so any blocked rx.recv() returns Err
+        //      immediately (sender dropped).
+        //   3. Synchronously join the bridge thread so it's
+        //      definitively gone before this Drop returns.
+        //
+        // Without (3), the bridge thread can keep running after the
+        // Python interpreter finalizes — see #16. Watcher poll thread
+        // (in honker-core) is already joined synchronously by
+        // SharedUpdateWatcher::close(), but the bridge thread is the
+        // one that calls back into Python and the one that panicked.
+        self.shutdown.store(true, Ordering::Release);
         self.shared.unsubscribe(self.sub_id);
+
+        let handle = self.inner.lock().bridge_handle.take();
+        if let Some(handle) = handle {
+            // CPython's deallocator calls Drop with the GIL held. The
+            // bridge thread, if mid-`Python::attach`, is itself
+            // blocked acquiring the GIL we hold — so a naive `join()`
+            // would deadlock. Release the GIL via `py.detach` while
+            // we wait so the bridge thread can finish its in-flight
+            // attach, observe the cleared sender, and exit.
+            //
+            // `Python::attach` (0.28's rename of `with_gil`) is
+            // reentrant: a no-op acquisition if we already hold it
+            // (the typical pyclass-Drop case). `attach`-then-`detach`
+            // works whether or not we entered with the GIL.
+            //
+            // If the interpreter is being finalized (rare; normally
+            // pyclass dealloc runs before Py_FinalizeEx), `attach`
+            // could fail. Guard with catch_unwind so a panic from
+            // PyO3 internals doesn't propagate through Drop.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Python::attach(|py| {
+                    py.detach(|| {
+                        let _ = handle.join();
+                    });
+                });
+            }));
+        }
     }
 }
 
@@ -489,16 +544,29 @@ impl UpdateEvents {
         let loop_py: Py<PyAny> = loop_obj.unbind();
 
         let rx = state.rx.take().expect("update rx already taken");
+        let shutdown = self.shutdown.clone();
 
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("honker-update-bridge".into())
             .spawn(move || {
-                // Blocks on the subscriber channel. Exits when the
-                // shared watcher's sender list prunes this subscriber
-                // (happens when the Arc<SharedUpdateWatcher> inside
-                // UpdateEvents is dropped, severing our end of the
-                // channel — recv() then returns Err).
+                // Blocks on the subscriber channel. Exits when:
+                //   * the shared watcher's sender list prunes this
+                //     subscriber (Drop -> unsubscribe -> sender dropped
+                //     -> recv() returns Err), OR
+                //   * the shutdown flag is set (Drop sets it before
+                //     unsubscribing). The check sits BETWEEN recv() and
+                //     `Python::attach` so a tick that landed before
+                //     shutdown was set doesn't trigger a Python call
+                //     after the interpreter is mid-teardown.
+                //
+                // Without the shutdown check + the synchronous join in
+                // Drop, the bridge thread could outlive the Python
+                // interpreter and panic on the next attach (#16 in the
+                // honker repo).
                 while rx.recv().is_ok() {
+                    if shutdown.load(Ordering::Acquire) {
+                        return;
+                    }
                     Python::attach(|py| {
                         let put = match queue_py_for_thread.getattr(py, "put_nowait") {
                             Ok(v) => v,
@@ -511,6 +579,7 @@ impl UpdateEvents {
             .map_err(core_err)?;
 
         state.queue = Some(queue_py.clone_ref(py));
+        state.bridge_handle = Some(handle);
         Ok(queue_py)
     }
 }
