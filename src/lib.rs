@@ -245,6 +245,37 @@ impl Database {
         self.writer.close();
         self.readers.close();
     }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __exit__(
+        &self,
+        _exc_type: Option<&Bound<'_, PyAny>>,
+        _exc_val: Option<&Bound<'_, PyAny>>,
+        _exc_tb: Option<&Bound<'_, PyAny>>,
+    ) -> bool {
+        self.close();
+        false
+    }
+}
+
+impl Drop for Database {
+    /// Mirror what `close()` does so that `db = honker.open(...)`
+    /// without an explicit close still releases SQLite handles when
+    /// CPython refcounts the `Database` to zero (e.g. at end of test
+    /// scope). Required for `tempfile.TemporaryDirectory` cleanup on
+    /// Windows: mandatory locking blocks unlink while any connection
+    /// is alive, and Python tests can't be relied on to call
+    /// `close()` explicitly. Idempotent with `close()`.
+    fn drop(&mut self) {
+        if let Some(shared) = self.shared_watcher.lock().take() {
+            let _ = shared.close();
+        }
+        self.writer.close();
+        self.readers.close();
+    }
 }
 
 // ---------------------------------------------------------------------
