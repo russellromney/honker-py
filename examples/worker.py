@@ -1,7 +1,7 @@
 """End-to-end worker loop.
 
 Enqueues a few jobs, runs an async worker loop that drains them via
-the long-lived `claim()` iterator (wakes on every WAL commit, no
+the long-lived `claim()` iterator (wakes on every database update, no
 polling), and exits when the queue is empty.
 
 This is the idiomatic Python worker shape: one async iterator, one
