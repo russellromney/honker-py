@@ -216,6 +216,35 @@ impl Database {
         self.readers.release(conn);
         result
     }
+
+    /// Release the underlying SQLite handles and the watcher poll
+    /// thread so the OS can unlink the database file. After `close()`,
+    /// any further `transaction()` / `query()` / `update_events()`
+    /// calls return an error.
+    ///
+    /// Idempotent. Safe to call from `__exit__`/`finally` blocks even
+    /// if the database was never used.
+    ///
+    /// Why this matters on Windows: SQLite holds the `.db` file open
+    /// for the lifetime of every Connection, and Windows' mandatory
+    /// locking blocks `unlink` while any handle is alive. Without
+    /// explicit close, the writer/reader connections live until the
+    /// Python GC drops every Transaction object that ever cloned the
+    /// `Arc<Writer>` — which a `tempfile.TemporaryDirectory` cleanup
+    /// can't force.
+    fn close(&self) {
+        // Drop the watcher's read-only connection (joins the poll
+        // thread synchronously) first so no background reader is
+        // racing the writer/reader closes below.
+        if let Some(shared) = self.shared_watcher.lock().take() {
+            let _ = shared.close();
+        }
+        // These reach inside the Arc<Writer> / Arc<Readers> and drop
+        // the underlying Connection regardless of how many Arc clones
+        // exist (Transactions still alive in Python, etc.).
+        self.writer.close();
+        self.readers.close();
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -256,10 +285,13 @@ impl Transaction {
         let writer = slf.writer.clone();
         // Fast path: uncontended slot acquire doesn't release the GIL.
         // Slow path: GIL released while we wait on the writer condvar.
-        let conn = match writer.try_acquire() {
-            Some(c) => c,
-            None => py.detach(|| writer.acquire()),
-        };
+        // Either path returns None if the database has been closed.
+        let conn = writer
+            .try_acquire()
+            .or_else(|| py.detach(|| writer.acquire()))
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("Database is closed")
+            })?;
         match run_cached_noparams(&conn, "BEGIN IMMEDIATE") {
             Ok(()) => {
                 {
