@@ -83,6 +83,13 @@ class Listener:
     def __aiter__(self):
         return self
 
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
+        await self.aclose()
+        return False
+
     def close(self) -> None:
         updates = self._updates
         self._updates = None
@@ -735,6 +742,13 @@ class _StreamIter:
     def __aiter__(self):
         return self
 
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
+        await self.aclose()
+        return False
+
     def close(self) -> None:
         updates = self._updates
         self._updates = None
@@ -1226,6 +1240,13 @@ class _WorkerQueueIter:
 
     def __aiter__(self):
         return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
+        await self.aclose()
+        return False
 
     def close(self) -> None:
         updates = self._updates
