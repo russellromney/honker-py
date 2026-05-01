@@ -32,6 +32,18 @@ jobs:
       - name: Prep submodule path
         run: rm -rf main/packages/honker
 
+      - name: Align honker-core version for PR smoke
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("main/honker-core/Cargo.toml")
+          text = p.read_text()
+          old = 'version = "0.2.1"'
+          new = 'version = "0.2.2"'
+          if old in text:
+            p.write_text(text.replace(old, new, 1))
+          PY
+
       - name: Checkout honker PR
         uses: actions/checkout@v4
         with:
