@@ -7,7 +7,7 @@ from collections import deque
 from typing import Any, AsyncIterator, Callable, Optional
 
 
-def _core_open(path, max_readers, watcher_backend):
+def _core_open(path, max_readers, watcher_backend=None):
     from honker._honker_native import open as _open
     return _open(path, max_readers=max_readers, watcher_backend=watcher_backend)
 
