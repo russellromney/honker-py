@@ -292,6 +292,17 @@ class Queue:
         data = json.loads(rows[0]["rows_json"])
         return [Job(self, row) for row in data]
 
+    def _next_claim_at(self) -> int:
+        """Return the next future unix timestamp that could make this
+        queue claimable, or 0 if no future deadline exists.
+        """
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT honker_queue_next_claim_at(?) AS t",
+                [self.name],
+            )
+        return int(rows[0]["t"])
+
     def ack_batch(self, job_ids, worker_id: str) -> int:
         """Ack multiple jobs in one tx. Delegates to `honker_ack_batch`.
         Returns count of jobs whose claim was still valid."""
@@ -404,28 +415,34 @@ class Queue:
         # wake into our mpsc channel rather than to nobody. Regression
         # guard: tests/test_subscribe_race.py.
         updates = self.db.update_events()
-        found, value = self.get_result(job_id)
-        if found:
-            return value
-        while True:
-            remaining = (
-                max(0.0, deadline - time.time()) if deadline is not None else 15.0
-            )
-            if deadline is not None and remaining <= 0:
-                raise asyncio.TimeoutError(
-                    f"wait_result({job_id}) timed out"
-                )
-            try:
-                await asyncio.wait_for(updates.__anext__(), timeout=remaining)
-            except asyncio.TimeoutError:
-                if deadline is None:
-                    # Paranoia-poll on the 15s fallback; loop again.
-                    pass
-                else:
-                    raise
+        try:
             found, value = self.get_result(job_id)
             if found:
                 return value
+            while True:
+                remaining = (
+                    max(0.0, deadline - time.time()) if deadline is not None else 15.0
+                )
+                if deadline is not None and remaining <= 0:
+                    raise asyncio.TimeoutError(
+                        f"wait_result({job_id}) timed out"
+                    )
+                try:
+                    await asyncio.wait_for(updates.__anext__(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    if deadline is None:
+                        # Paranoia-poll on the 15s fallback; loop again.
+                        pass
+                    else:
+                        raise
+                found, value = self.get_result(job_id)
+                if found:
+                    return value
+        finally:
+            close = getattr(updates, "close", None)
+            if callable(close):
+                close()
+            del updates
 
     def sweep_results(self) -> int:
         """Delete all expired result rows. Returns count deleted.
@@ -1175,7 +1192,10 @@ class _WorkerQueueIter:
       1. update watcher (`db.update_events()`): ~1ms wake on any commit
          to this database from any process. The shared watcher fans
          out to every subscriber; over-triggering is cheap.
-      2. `idle_poll_s` timeout: paranoia fallback if the update watcher
+      2. next claim-relevant deadline (`run_at` or `claim_expires_at`):
+         wake when the row actually becomes claimable, even if no new
+         commit lands then.
+      3. `idle_poll_s` timeout: paranoia fallback if the update watcher
          can't fire (sandboxed FS, odd container mount).
     """
 
@@ -1188,21 +1208,48 @@ class _WorkerQueueIter:
         # mpsc channel rather than firing to nobody. Regression guard:
         # tests/test_subscribe_race.py.
         self._updates = queue.db.update_events()
+        self._closed = False
+
+    def _close_updates(self):
+        if self._closed:
+            return
+        self._closed = True
+        updates = getattr(self, "_updates", None)
+        if updates is not None:
+            close = getattr(updates, "close", None)
+            if callable(close):
+                close()
+        self._updates = None
 
     def __aiter__(self):
         return self
 
+    def __del__(self):
+        self._close_updates()
+
     async def __anext__(self):
-        while True:
-            jobs = self.queue.claim_batch(self.worker_id, 1)
-            if jobs:
-                return jobs[0]
-            try:
-                await asyncio.wait_for(
-                    self._updates.__anext__(),
-                    timeout=self.idle_poll_s,
-                )
-            except asyncio.TimeoutError:
-                pass
-            except StopAsyncIteration:
-                raise StopAsyncIteration
+        try:
+            while True:
+                jobs = self.queue.claim_batch(self.worker_id, 1)
+                if jobs:
+                    return jobs[0]
+                timeout_s = self.idle_poll_s
+                next_claim_at = self.queue._next_claim_at()
+                if next_claim_at > 0:
+                    timeout_s = min(
+                        timeout_s,
+                        max(0.0, next_claim_at - time.time()),
+                    )
+                try:
+                    await asyncio.wait_for(
+                        self._updates.__anext__(),
+                        timeout=timeout_s,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                except StopAsyncIteration:
+                    self._close_updates()
+                    raise StopAsyncIteration
+        except asyncio.CancelledError:
+            self._close_updates()
+            raise

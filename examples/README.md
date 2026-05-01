@@ -13,7 +13,7 @@ PYTHONPATH=packages .venv/bin/python packages/honker/examples/atomic.py
 | [`worker.py`](worker.py) | Low-level async worker loop with retry → dead-letter (no decorators). |
 | [`notify_listen.py`](notify_listen.py) | Ephemeral `pg_notify`-style pub/sub. |
 | [`stream.py`](stream.py) | Durable pub/sub with per-consumer offset tracking + resume-after-crash. |
-| [`scheduler.py`](scheduler.py) | Cron-style periodic tasks with leader election. Waits for a real minute boundary. |
+| [`scheduler.py`](scheduler.py) | Time-trigger scheduling with leader election. Shows cron-style schedules; the library also supports `every_s(...)` and 6-field cron. |
 
 The task example also demonstrates the CLI worker flow:
 
