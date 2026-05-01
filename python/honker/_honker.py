@@ -415,28 +415,31 @@ class Queue:
         # wake into our mpsc channel rather than to nobody. Regression
         # guard: tests/test_subscribe_race.py.
         updates = self.db.update_events()
-        found, value = self.get_result(job_id)
-        if found:
-            return value
-        while True:
-            remaining = (
-                max(0.0, deadline - time.time()) if deadline is not None else 15.0
-            )
-            if deadline is not None and remaining <= 0:
-                raise asyncio.TimeoutError(
-                    f"wait_result({job_id}) timed out"
-                )
-            try:
-                await asyncio.wait_for(updates.__anext__(), timeout=remaining)
-            except asyncio.TimeoutError:
-                if deadline is None:
-                    # Paranoia-poll on the 15s fallback; loop again.
-                    pass
-                else:
-                    raise
+        try:
             found, value = self.get_result(job_id)
             if found:
                 return value
+            while True:
+                remaining = (
+                    max(0.0, deadline - time.time()) if deadline is not None else 15.0
+                )
+                if deadline is not None and remaining <= 0:
+                    raise asyncio.TimeoutError(
+                        f"wait_result({job_id}) timed out"
+                    )
+                try:
+                    await asyncio.wait_for(updates.__anext__(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    if deadline is None:
+                        # Paranoia-poll on the 15s fallback; loop again.
+                        pass
+                    else:
+                        raise
+                found, value = self.get_result(job_id)
+                if found:
+                    return value
+        finally:
+            updates.close()
 
     def sweep_results(self) -> int:
         """Delete all expired result rows. Returns count deleted.
