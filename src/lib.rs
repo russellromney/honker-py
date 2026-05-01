@@ -178,10 +178,19 @@ impl Database {
         // its own transactions — same implementations the loadable
         // extension registers, no `.dylib` load needed at runtime.
         honker_core::attach_honker_functions(&writer_conn).map_err(core_err)?;
+        // Probe the chosen backend now (after the writer connection has
+        // created -wal / -shm in WAL mode). Failures raise from open()
+        // so a backend that can't run never silently produces no wakes.
+        let db_path: std::path::PathBuf = path.into();
+        if let Err(reason) = watcher_config.backend.probe(&db_path) {
+            return Err(PyRuntimeError::new_err(format!(
+                "watcher_backend probe failed: {reason}"
+            )));
+        }
         Ok(Self {
             writer: Arc::new(Writer::new(writer_conn)),
-            readers: Arc::new(Readers::new(path.clone(), max_readers)),
-            db_path: path.into(),
+            readers: Arc::new(Readers::new(db_path.to_string_lossy().into_owned(), max_readers)),
+            db_path,
             shared_watcher: Mutex::new(None),
             watcher_config,
         })
