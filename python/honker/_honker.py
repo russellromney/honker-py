@@ -439,7 +439,10 @@ class Queue:
                 if found:
                     return value
         finally:
-            updates.close()
+            close = getattr(updates, "close", None)
+            if callable(close):
+                close()
+            del updates
 
     def sweep_results(self) -> int:
         """Delete all expired result rows. Returns count deleted.
