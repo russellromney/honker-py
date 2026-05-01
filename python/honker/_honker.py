@@ -1190,28 +1190,48 @@ class _WorkerQueueIter:
         # mpsc channel rather than firing to nobody. Regression guard:
         # tests/test_subscribe_race.py.
         self._updates = queue.db.update_events()
+        self._closed = False
+
+    def _close_updates(self):
+        if self._closed:
+            return
+        self._closed = True
+        updates = getattr(self, "_updates", None)
+        if updates is not None:
+            close = getattr(updates, "close", None)
+            if callable(close):
+                close()
+        self._updates = None
 
     def __aiter__(self):
         return self
 
+    def __del__(self):
+        self._close_updates()
+
     async def __anext__(self):
-        while True:
-            jobs = self.queue.claim_batch(self.worker_id, 1)
-            if jobs:
-                return jobs[0]
-            timeout_s = self.idle_poll_s
-            next_claim_at = self.queue._next_claim_at()
-            if next_claim_at > 0:
-                timeout_s = min(
-                    timeout_s,
-                    max(0.0, next_claim_at - time.time()),
-                )
-            try:
-                await asyncio.wait_for(
-                    self._updates.__anext__(),
-                    timeout=timeout_s,
-                )
-            except asyncio.TimeoutError:
-                pass
-            except StopAsyncIteration:
-                raise StopAsyncIteration
+        try:
+            while True:
+                jobs = self.queue.claim_batch(self.worker_id, 1)
+                if jobs:
+                    return jobs[0]
+                timeout_s = self.idle_poll_s
+                next_claim_at = self.queue._next_claim_at()
+                if next_claim_at > 0:
+                    timeout_s = min(
+                        timeout_s,
+                        max(0.0, next_claim_at - time.time()),
+                    )
+                try:
+                    await asyncio.wait_for(
+                        self._updates.__anext__(),
+                        timeout=timeout_s,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                except StopAsyncIteration:
+                    self._close_updates()
+                    raise StopAsyncIteration
+        except asyncio.CancelledError:
+            self._close_updates()
+            raise
