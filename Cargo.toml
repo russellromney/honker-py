@@ -12,6 +12,9 @@ publish = false
 # `version` is the crates.io fallback for standalone builds.
 [workspace]
 
+[features]
+bundled-sqlite = ["honker-core/bundled-sqlite", "rusqlite/bundled"]
+
 [lib]
 name = "_honker_native"
 crate-type = ["cdylib"]
