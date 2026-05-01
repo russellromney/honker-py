@@ -19,7 +19,60 @@ permissions:
   contents: read
 
 jobs:
+  pr-smoke:
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main honker
+        uses: actions/checkout@v4
+        with:
+          repository: russellromney/honker
+          path: main
+
+      - name: Prep submodule path
+        run: rm -rf main/packages/honker
+
+      - name: Align honker-core version for PR smoke
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("main/honker-core/Cargo.toml")
+          text = p.read_text()
+          old = 'version = "0.2.1"'
+          new = 'version = "0.2.2"'
+          if old in text:
+            p.write_text(text.replace(old, new, 1))
+          PY
+
+      - name: Checkout honker PR
+        uses: actions/checkout@v4
+        with:
+          path: main/packages/honker
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install maturin
+        run: python -m pip install 'maturin>=1.7,<2'
+
+      - name: Build extension
+        working-directory: main
+        run: cargo build --release -p honker-extension
+
+      - name: Build wheel smoke
+        working-directory: main/packages/honker
+        run: maturin build --release --out dist
+
   linux:
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -55,6 +108,7 @@ jobs:
           path: dist
 
   musllinux:
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -86,6 +140,7 @@ jobs:
           path: dist
 
   windows:
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -113,6 +168,7 @@ jobs:
           path: dist
 
   macos:
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -139,6 +195,7 @@ jobs:
           path: dist
 
   sdist:
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

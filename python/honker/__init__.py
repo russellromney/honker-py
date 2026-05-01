@@ -15,6 +15,7 @@ from honker._scheduler import (
     CronSchedule,
     Scheduler,
     crontab,
+    every_s,
 )
 from honker._tasks import (
     TaskResult,
@@ -39,6 +40,7 @@ __all__ = [
     "TaskResult",
     "UnknownTaskError",
     "crontab",
+    "every_s",
     "open",
     "registry",
     "run_workers",
