@@ -292,6 +292,17 @@ class Queue:
         data = json.loads(rows[0]["rows_json"])
         return [Job(self, row) for row in data]
 
+    def _next_claim_at(self) -> int:
+        """Return the next future unix timestamp that could make this
+        queue claimable, or 0 if no future deadline exists.
+        """
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT honker_queue_next_claim_at(?) AS t",
+                [self.name],
+            )
+        return int(rows[0]["t"])
+
     def ack_batch(self, job_ids, worker_id: str) -> int:
         """Ack multiple jobs in one tx. Delegates to `honker_ack_batch`.
         Returns count of jobs whose claim was still valid."""
@@ -1157,7 +1168,10 @@ class _WorkerQueueIter:
       1. update watcher (`db.update_events()`): ~1ms wake on any commit
          to this database from any process. The shared watcher fans
          out to every subscriber; over-triggering is cheap.
-      2. `idle_poll_s` timeout: paranoia fallback if the update watcher
+      2. next claim-relevant deadline (`run_at` or `claim_expires_at`):
+         wake when the row actually becomes claimable, even if no new
+         commit lands then.
+      3. `idle_poll_s` timeout: paranoia fallback if the update watcher
          can't fire (sandboxed FS, odd container mount).
     """
 
@@ -1179,10 +1193,17 @@ class _WorkerQueueIter:
             jobs = self.queue.claim_batch(self.worker_id, 1)
             if jobs:
                 return jobs[0]
+            timeout_s = self.idle_poll_s
+            next_claim_at = self.queue._next_claim_at()
+            if next_claim_at > 0:
+                timeout_s = min(
+                    timeout_s,
+                    max(0.0, next_claim_at - time.time()),
+                )
             try:
                 await asyncio.wait_for(
                     self._updates.__anext__(),
-                    timeout=self.idle_poll_s,
+                    timeout=timeout_s,
                 )
             except asyncio.TimeoutError:
                 pass

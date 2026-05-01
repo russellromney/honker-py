@@ -1,4 +1,4 @@
-"""Crontab-style periodic-task scheduler for honker.
+"""Time-trigger scheduler for honker.
 
 A scheduler process holds a set of named schedules (cron expressions
 → queue + payload). On each cron boundary, it enqueues the payload
@@ -25,7 +25,7 @@ Usage:
 
     import asyncio
     import honker
-    from honker import Scheduler, crontab
+    from honker import Scheduler, crontab, every_s
 
     db = honker.open("app.db")
     scheduler = Scheduler(db)
@@ -39,7 +39,7 @@ Usage:
     scheduler.add(
         name="every-five",
         queue="health",
-        schedule=crontab("*/5 * * * *"),
+        schedule=every_s(5),
     )
     asyncio.run(scheduler.run())
 """
@@ -56,29 +56,23 @@ from honker import _honker_native
 
 
 class CronSchedule:
-    """Thin marker around a 5-field cron expression. All parsing and
-    next-boundary computation lives in Rust (`honker.cron_next_after`
- / `honker_cron_next_after`) so every language binding shares one
-    implementation.
+    """Thin marker around a scheduler expression.
 
-    Fields (standard Unix cron):
-      - minute       (0-59)
-      - hour         (0-23)
-      - day-of-month (1-31)
-      - month        (1-12)
-      - day-of-week  (0-6, Sunday=0)
+    All parsing and next-boundary computation lives in Rust
+    (`honker.cron_next_after` / `honker_cron_next_after`) so every
+    language binding shares one implementation.
 
-    Calendar arithmetic runs in the system local time zone — same as
-    standard cron. Set `TZ=UTC` in the scheduler's environment if you
-    want UTC boundaries.
+    Valid expression shapes:
+      - 5-field cron: `minute hour dom month dow`
+      - 6-field cron: `second minute hour dom month dow`
+      - interval expression: `@every <n><unit>` (e.g. `@every 1s`)
     """
 
     __slots__ = ("expr",)
 
     def __init__(self, expr: str):
         # Validate eagerly by asking Rust to compute one boundary from
-        # a known timestamp. Raises ValueError on malformed input
-        # (field count, out-of-range, inverted range, bad step).
+        # a known timestamp. Raises ValueError on malformed input.
         _honker_native.cron_next_after(expr, 0)
         self.expr = expr
 
@@ -87,8 +81,7 @@ class CronSchedule:
 
     def next_after(self, dt: datetime) -> datetime:
         """Return the next datetime strictly after `dt` matching this
-        schedule, at minute precision. Pure function — no db needed.
-        Raises `ValueError` if no match exists within ~5 years.
+        schedule expression. Pure function — no db needed.
         """
         return datetime.fromtimestamp(
             _honker_native.cron_next_after(self.expr, int(dt.timestamp()))
@@ -96,8 +89,22 @@ class CronSchedule:
 
 
 def crontab(expr: str) -> CronSchedule:
-    """Parse a 5-field cron expression into a `CronSchedule`."""
+    """Parse a 5-field or 6-field cron expression into a
+    `CronSchedule`.
+    """
+    if expr.strip().startswith("@every"):
+        raise ValueError("use every_s(...) for interval schedules")
     return CronSchedule(expr)
+
+
+def every_s(seconds: int) -> CronSchedule:
+    """Build a fixed-interval schedule expression persisted as
+    `@every <n>s`.
+    """
+    seconds = int(seconds)
+    if seconds <= 0:
+        raise ValueError("every_s(seconds) requires a positive integer")
+    return CronSchedule(f"@every {seconds}s")
 
 
 class Scheduler:
@@ -145,6 +152,7 @@ class Scheduler:
         payload: Any = None,
         priority: int = 0,
         expires: Optional[float] = None,
+        max_runs: Optional[int] = None,
     ) -> None:
         """Register a periodic task in `_honker_scheduler_tasks`.
 
@@ -152,16 +160,19 @@ class Scheduler:
           with the same name replaces the first registration
           entirely (including cron expr, queue, payload).
         - `queue`: the queue to enqueue into on each boundary.
-        - `schedule`: a `CronSchedule` from `crontab(expr)`.
+        - `schedule`: a `CronSchedule` from `crontab(expr)` or
+          `every_s(n)`.
         - `payload`: the payload for enqueued jobs. Default None.
         - `priority`: enqueue priority for fired jobs.
         - `expires`: how many seconds a fired job stays claimable.
           `queue.sweep_expired()` moves expired rows into
           `_honker_dead`.
+        - `max_runs`: optional cap on total fires before automatic
+          unregistration.
         """
         with self.db.transaction() as tx:
             tx.query(
-                "SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?)",
+                "SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?, ?)",
                 [
                     name,
                     queue,
@@ -169,6 +180,7 @@ class Scheduler:
                     json.dumps(payload),
                     int(priority),
                     int(expires) if expires is not None else None,
+                    int(max_runs) if max_runs is not None else None,
                 ],
             )
         self._registered.add(name)

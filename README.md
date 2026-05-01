@@ -77,15 +77,15 @@ with db.transaction() as tx:
     tx.execute("INSERT INTO orders (user_id) VALUES (?)", [42])
     emails.enqueue({"to": "alice@example.com"}, tx=tx)   # atomic with order
 
-# Then in a worker, do: 
-async for job in emails.claim("worker-1"):               # wakes on any database update
+# Then in a worker, do:
+async for job in emails.claim("worker-1"):               # wakes on updates or due deadlines
     try:
         send(job.payload); job.ack()
     except Exception as e:
         job.retry(delay_s=60, error=str(e))
 ```
 
-`claim()` is an async iterator. Each iteration is one `claim_batch(worker_id, 1)`. Wakes on any database update, falls back to a 5 s paranoia poll only if the update watcher can't fire. For batched work, call `claim_batch(worker_id, n)` explicitly and ack with `queue.ack_batch(ids, worker_id)`. Defaults: visibility 300 s.
+`claim()` is an async iterator. Each iteration is one `claim_batch(worker_id, 1)`. Wakes on any database update, or when the next claim-relevant deadline arrives (`run_at` for delayed jobs, or `claim_expires_at` for reclaims). Falls back to a 5 s paranoia poll only if the update watcher can't fire. For batched work, call `claim_batch(worker_id, n)` explicitly and ack with `queue.ack_batch(ids, worker_id)`. Defaults: visibility 300 s.
 
 ### Python: tasks (Huey-style decorators)
 
@@ -108,7 +108,7 @@ Worker side, either in-process or as its own process:
 python -m honker worker myapp.tasks:db --queue=emails --concurrency=4
 ```
 
-Auto-name is `{module}.{qualname}` (Huey/Celery convention). Explicit names with `@emails.task(name="...")` are recommended in prod so renames don't orphan pending jobs. Periodic tasks use `@emails.periodic_task(crontab("0 3 * * *"))`. Full details in [`packages/honker/examples/tasks.py`](packages/honker/examples/tasks.py).
+Auto-name is `{module}.{qualname}` (Huey/Celery convention). Explicit names with `@emails.task(name="...")` are recommended in prod so renames don't orphan pending jobs. Periodic tasks use `@emails.periodic_task(crontab("0 3 * * *"))` or `@emails.periodic_task(every_s(5))`. Full details in [`packages/honker/examples/tasks.py`](packages/honker/examples/tasks.py).
 
 ### Python: stream (durable pub/sub)
 
@@ -171,12 +171,17 @@ SELECT honker_lock_acquire('backup', 'me', 60);              -- 1 = got it, 0 = 
 SELECT honker_lock_release('backup', 'me');                  -- 1 = released
 SELECT honker_rate_limit_try('api', 10, 60);                 -- 1 = under, 0 = at limit
 SELECT honker_rate_limit_sweep(3600);                        -- drop windows >1h old
-SELECT honker_cron_next_after('0 3 * * *', unixepoch());     -- unix ts of next fire
+SELECT honker_cron_next_after('0 3 * * *', unixepoch());     -- 5-field cron
+SELECT honker_cron_next_after('*/2 * * * * *', unixepoch()); -- 6-field cron
+SELECT honker_cron_next_after('@every 5s', unixepoch());     -- interval schedule
 SELECT honker_scheduler_register('nightly', 'backups',
-  '0 3 * * *', '"go"', 0, NULL);                         -- register periodic task
+  '0 3 * * *', '"go"', 0, NULL, NULL);                   -- register periodic task
+SELECT honker_scheduler_register('fast', 'backups',
+  '@every 5s', '"go"', 0, NULL, NULL);                   -- interval schedule
 SELECT honker_scheduler_tick(unixepoch());                   -- JSON: fires due
 SELECT honker_scheduler_soonest();                           -- min next_fire_at
 SELECT honker_scheduler_unregister('nightly');               -- 1 = deleted
+SELECT honker_queue_next_claim_at('emails');                 -- next run_at / reclaim deadline
 SELECT honker_stream_publish('orders', 'k', '{"id":42}');    -- returns offset
 SELECT honker_stream_read_since('orders', 0, 1000);          -- JSON array
 SELECT honker_stream_save_offset('worker', 'orders', 42);    -- monotonic upsert
