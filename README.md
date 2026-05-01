@@ -175,9 +175,9 @@ SELECT honker_cron_next_after('0 3 * * *', unixepoch());     -- 5-field cron
 SELECT honker_cron_next_after('*/2 * * * * *', unixepoch()); -- 6-field cron
 SELECT honker_cron_next_after('@every 5s', unixepoch());     -- interval schedule
 SELECT honker_scheduler_register('nightly', 'backups',
-  '0 3 * * *', '"go"', 0, NULL, NULL);                   -- register periodic task
+  '0 3 * * *', '"go"', 0, NULL);                         -- register periodic task
 SELECT honker_scheduler_register('fast', 'backups',
-  '@every 5s', '"go"', 0, NULL, NULL);                   -- interval schedule
+  '@every 5s', '"go"', 0, NULL);                         -- interval schedule
 SELECT honker_scheduler_tick(unixepoch());                   -- JSON: fires due
 SELECT honker_scheduler_soonest();                           -- min next_fire_at
 SELECT honker_scheduler_unregister('nightly');               -- 1 = deleted

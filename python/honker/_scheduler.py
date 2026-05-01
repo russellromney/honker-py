@@ -152,7 +152,6 @@ class Scheduler:
         payload: Any = None,
         priority: int = 0,
         expires: Optional[float] = None,
-        max_runs: Optional[int] = None,
     ) -> None:
         """Register a periodic task in `_honker_scheduler_tasks`.
 
@@ -167,12 +166,10 @@ class Scheduler:
         - `expires`: how many seconds a fired job stays claimable.
           `queue.sweep_expired()` moves expired rows into
           `_honker_dead`.
-        - `max_runs`: optional cap on total fires before automatic
-          unregistration.
         """
         with self.db.transaction() as tx:
             tx.query(
-                "SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?, ?)",
+                "SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?)",
                 [
                     name,
                     queue,
@@ -180,7 +177,6 @@ class Scheduler:
                     json.dumps(payload),
                     int(priority),
                     int(expires) if expires is not None else None,
-                    int(max_runs) if max_runs is not None else None,
                 ],
             )
         self._registered.add(name)
