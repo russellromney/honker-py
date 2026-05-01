@@ -51,7 +51,8 @@ Today:
 - Single-digit millisecond cross-process reaction time, no polling
 - Handler timeouts, declarative retries with exponential backoff
 - Delayed jobs, task expiration, named locks, rate-limiting
-- Crontab-style periodic tasks with a leader-elected scheduler
+- Time-trigger scheduling with a leader-elected scheduler:
+  5-field cron, 6-field cron, and `@every <n><unit>`
 - Opt-in task result storage (`enqueue` returns an id, worker persists the
   return value, caller awaits `queue.wait_result(id)`)
 - Durable streams with per-consumer offsets and configurable flush interval
