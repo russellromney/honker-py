@@ -22,34 +22,14 @@ fn core_err<E: std::fmt::Display>(e: E) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
-/// Parse the optional `watcher_backend` string into a [`WatcherConfig`].
-/// Defers to [`honker_core::WatcherBackend::parse`] so the accepted
-/// aliases stay in sync with the Node binding. Surfaces a one-line
-/// stderr warning when a requested backend isn't compiled in.
 fn parse_watcher_backend(backend: Option<String>) -> PyResult<WatcherConfig> {
-    use honker_core::{WatcherBackend, WatcherBackendNote};
-    match WatcherBackend::parse(backend.as_deref()) {
-        Ok((b, WatcherBackendNote::Ok)) => Ok(WatcherConfig { backend: b }),
-        Ok((b, WatcherBackendNote::KernelWatchUnavailable)) => {
-            eprintln!(
-                "honker: this build was not compiled with the \
-                 `kernel-watcher` feature; falling back to polling"
-            );
-            Ok(WatcherConfig { backend: b })
-        }
-        Ok((b, WatcherBackendNote::ShmFastPathUnavailable)) => {
-            eprintln!(
-                "honker: this build was not compiled with the \
-                 `shm-fast-path` feature; falling back to polling"
-            );
-            Ok(WatcherConfig { backend: b })
-        }
-        Err(other) => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "unknown watcher_backend {:?}; valid values: \
-             None, 'polling', 'kernel', 'shm'",
-            other
-        ))),
-    }
+    honker_core::WatcherBackend::parse(backend.as_deref())
+        .map(|backend| WatcherConfig { backend })
+        .map_err(|other| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown watcher_backend {other:?}; valid: None, 'polling', 'kernel', 'shm'"
+            ))
+        })
 }
 
 // ---------------------------------------------------------------------
