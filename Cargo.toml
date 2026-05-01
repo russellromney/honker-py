@@ -16,6 +16,15 @@ publish = false
 name = "_honker_native"
 crate-type = ["cdylib"]
 
+[features]
+# Forward to honker-core. Enabled in CI / opt-in builds via maturin.
+# Pass `--features kernel-watcher` (or both) to maturin to ship a wheel
+# with the experimental backends compiled in. Wheels without these flags
+# silently fall back to polling when a Python caller passes
+# `watcher_backend="kernel"` or `"shm"`.
+kernel-watcher = ["honker-core/kernel-watcher"]
+shm-fast-path = ["honker-core/shm-fast-path"]
+
 [dependencies]
 honker-core = { path = "../../honker-core", version = "0.2.1" }
 parking_lot = "0.12.5"

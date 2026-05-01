@@ -8,7 +8,7 @@
 //! update watcher thread — lives in [`honker_core`] and is
 //! shared with the other bindings (cdylib extension, napi-rs Node).
 
-use honker_core::{Readers, SharedUpdateWatcher, Writer, open_conn};
+use honker_core::{Readers, SharedUpdateWatcher, WatcherConfig, Writer, open_conn};
 use parking_lot::Mutex;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
@@ -20,6 +20,59 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 fn core_err<E: std::fmt::Display>(e: E) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
+}
+
+/// Parse the optional `watcher_backend` string into a [`WatcherConfig`].
+///
+/// Accepted values:
+/// - `None` / `"polling"` / `"poll"` → default 1 ms PRAGMA polling.
+/// - `"kernel"` / `"kernel-watcher"` → kernel filesystem notifications.
+///   Requires the `kernel-watcher` Cargo feature; otherwise emits a
+///   warning and falls back to polling.
+/// - `"shm"` / `"shm-fast-path"` → mmap `-shm` fast path. Requires the
+///   `shm-fast-path` Cargo feature; otherwise warns and falls back.
+/// - Any other string → `ValueError`.
+fn parse_watcher_backend(backend: Option<String>) -> PyResult<WatcherConfig> {
+    use honker_core::WatcherBackend;
+    let b = match backend.as_deref() {
+        None | Some("polling") | Some("poll") => WatcherBackend::Polling,
+        Some("kernel") | Some("kernel-watcher") => {
+            #[cfg(feature = "kernel-watcher")]
+            {
+                WatcherBackend::KernelWatch
+            }
+            #[cfg(not(feature = "kernel-watcher"))]
+            {
+                eprintln!(
+                    "honker: this build was not compiled with the \
+                     `kernel-watcher` feature; falling back to polling"
+                );
+                WatcherBackend::Polling
+            }
+        }
+        Some("shm") | Some("shm-fast-path") => {
+            #[cfg(feature = "shm-fast-path")]
+            {
+                WatcherBackend::ShmFastPath
+            }
+            #[cfg(not(feature = "shm-fast-path"))]
+            {
+                eprintln!(
+                    "honker: this build was not compiled with the \
+                     `shm-fast-path` feature; falling back to polling"
+                );
+                WatcherBackend::Polling
+            }
+        }
+        Some(other) => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown watcher_backend {:?}; valid values: \
+                 None, 'polling', 'kernel', 'shm'",
+                other
+            )));
+        }
+    };
+    Ok(WatcherConfig { backend: b })
 }
 
 // ---------------------------------------------------------------------
@@ -145,13 +198,21 @@ struct Database {
     /// Lazy-initialized shared update watcher. One PRAGMA-poll thread per
     /// Database regardless of how many listeners subscribe.
     shared_watcher: Mutex<Option<Arc<SharedUpdateWatcher>>>,
+    /// Watcher backend chosen at `open()` time. Stored so the lazy
+    /// `update_events()` initialization picks up the right backend.
+    watcher_config: WatcherConfig,
 }
 
 #[pymethods]
 impl Database {
     #[new]
-    #[pyo3(signature = (path, max_readers=8))]
-    fn new(path: String, max_readers: usize) -> PyResult<Self> {
+    #[pyo3(signature = (path, max_readers=8, watcher_backend=None))]
+    fn new(
+        path: String,
+        max_readers: usize,
+        watcher_backend: Option<String>,
+    ) -> PyResult<Self> {
+        let watcher_config = parse_watcher_backend(watcher_backend)?;
         // Writer conn registers the notify() SQL function + ensures
         // _honker_notifications exists. Readers just SELECT.
         let writer_conn = open_conn(&path, true).map_err(core_err)?;
@@ -165,6 +226,7 @@ impl Database {
             readers: Arc::new(Readers::new(path.clone(), max_readers)),
             db_path: path.into(),
             shared_watcher: Mutex::new(None),
+            watcher_config,
         })
     }
 
@@ -188,7 +250,10 @@ impl Database {
             if let Some(existing) = guard.as_ref() {
                 existing.clone()
             } else {
-                let w = Arc::new(SharedUpdateWatcher::new(self.db_path.clone()));
+                let w = Arc::new(SharedUpdateWatcher::new_with_config(
+                    self.db_path.clone(),
+                    self.watcher_config.clone(),
+                ));
                 *guard = Some(w.clone());
                 w
             }
@@ -608,9 +673,13 @@ impl UpdateEvents {
 // ---------------------------------------------------------------------
 
 #[pyfunction]
-#[pyo3(signature = (path, max_readers=8))]
-fn open(path: String, max_readers: usize) -> PyResult<Database> {
-    Database::new(path, max_readers)
+#[pyo3(signature = (path, max_readers=8, watcher_backend=None))]
+fn open(
+    path: String,
+    max_readers: usize,
+    watcher_backend: Option<String>,
+) -> PyResult<Database> {
+    Database::new(path, max_readers, watcher_backend)
 }
 
 /// Compute the next unix timestamp strictly after `from_unix` that
